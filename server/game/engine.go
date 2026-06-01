@@ -50,6 +50,7 @@ type Engine struct {
 
 	// Estado Atual: "waiting_players", "waiting_ready", "playing", "point_scored", "gameover"
 	Status string
+	Frame  uint64
 
 	// Controles internos de tempo de estados (medido em ticks de 33ms)
 	timerTicks int
@@ -117,7 +118,7 @@ func (e *Engine) PlayerDisconnected() {
 }
 
 // ToggleReady muda o status do jogador de pronto/lobby com logs detalhados
-func (e *Engine) ToggleReady(side string) {
+func (e *Engine) ToggleReady(side string, canStart bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -136,6 +137,11 @@ func (e *Engine) ToggleReady(side string) {
 
 	// Se ambos estiverem prontos, inicia a partida de fato!
 	if e.PlayerLeftReady && e.PlayerRightReady {
+		if !canStart {
+			fmt.Println("[ENGINE] READY ignorado: os dois jogadores marcaram pronto, mas a sala nao tem dois sockets vivos.")
+			return
+		}
+
 		e.Status = "playing"
 		fmt.Println("[ENGINE] PARTIDA INICIADA! Ambos os jogadores estao prontos.")
 		e.ResetPositions()
@@ -196,6 +202,7 @@ func (e *Engine) SetPaddleDir(side string, dir float64) {
 func (e *Engine) Update() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.Frame++
 
 	// 1. Estados estáticos não rodam atualizações físicas
 	if e.Status == "waiting_players" || e.Status == "waiting_ready" {
@@ -346,6 +353,8 @@ func (e *Engine) GetStateJSON() ([]byte, error) {
 		S2      int    `json:"s2"`
 		P1Ready bool   `json:"p1_ready"`
 		P2Ready bool   `json:"p2_ready"`
+		Frame   uint64 `json:"frame"`
+		SentMs  int64  `json:"sent_ms"`
 	}{
 		Type:    "state",
 		State:   e.Status,
@@ -357,6 +366,8 @@ func (e *Engine) GetStateJSON() ([]byte, error) {
 		S2:      e.ScoreRight,
 		P1Ready: e.PlayerLeftReady,
 		P2Ready: e.PlayerRightReady,
+		Frame:   e.Frame,
+		SentMs:  time.Now().UnixMilli(),
 	}
 
 	return json.Marshal(state)

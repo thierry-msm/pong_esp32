@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"pong-server/game"
 	"pong-server/lobby"
+	"time"
 )
 
 func main() {
@@ -27,7 +28,11 @@ func main() {
 
 	// 6. Inicia o servidor na porta 8080
 	fmt.Println("Servidor Pong rodando na porta 8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	server := &http.Server{
+		Addr:              ":8080",
+		ReadHeaderTimeout: 2 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		fmt.Printf("Erro ao iniciar o servidor: %v\n", err)
 	}
 }

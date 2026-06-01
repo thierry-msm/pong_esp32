@@ -15,10 +15,11 @@ import (
 
 // Prazos limites para detecção de conexões fantasmas
 const (
-	writeWait      = 500 * time.Millisecond // Tempo maximo para tentar escrever uma mensagem
-	pongWait       = 10 * time.Second       // Tempo limite esperando a resposta do Pong
-	pingPeriod     = 4 * time.Second        // Frequencia de envio de pings (deve ser menor que pongWait)
-	stateQueueSize = 1                      // Mantem apenas o frame mais recente por cliente
+	writeWait       = 300 * time.Millisecond // Tempo maximo para tentar escrever uma mensagem
+	pongWait        = 4 * time.Second        // Tempo limite esperando a resposta do Pong
+	pingPeriod      = 1 * time.Second        // Frequencia de envio de pings (deve ser menor que pongWait)
+	clientFreshness = 3 * time.Second        // Janela maxima sem trafego/pong para considerar o jogador vivo
+	stateQueueSize  = 1                      // Mantem apenas o frame mais recente por cliente
 )
 
 var upgrader = websocket.Upgrader{
@@ -36,9 +37,49 @@ type Manager struct {
 }
 
 type Client struct {
-	conn *websocket.Conn
-	side string
-	send chan []byte
+	conn          *websocket.Conn
+	side          string
+	send          chan []byte
+	mu            sync.Mutex
+	lastSeen      time.Time
+	lastDropLog   time.Time
+	droppedFrames int
+}
+
+func newClient(conn *websocket.Conn, side string) *Client {
+	return &Client{
+		conn:     conn,
+		side:     side,
+		send:     make(chan []byte, stateQueueSize),
+		lastSeen: time.Now(),
+	}
+}
+
+func (c *Client) markSeen() {
+	c.mu.Lock()
+	c.lastSeen = time.Now()
+	c.mu.Unlock()
+}
+
+func (c *Client) isFresh(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return now.Sub(c.lastSeen) <= clientFreshness
+}
+
+func (c *Client) recordDroppedFrame() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.droppedFrames++
+	now := time.Now()
+	if now.Sub(c.lastDropLog) < 2*time.Second {
+		return
+	}
+
+	fmt.Printf("[WS DROP] Cliente [%s] atrasou; %d frame(s) antigo(s) descartado(s).\n", c.side, c.droppedFrames)
+	c.droppedFrames = 0
+	c.lastDropLog = now
 }
 
 // NewManager cria e configura um novo gerenciador de lobby
@@ -71,29 +112,21 @@ func (m *Manager) HandleWS(w http.ResponseWriter, r *http.Request) {
 		_ = tcpConn.SetNoDelay(true)
 	}
 
-	// Define políticas de segurança e monitoramento de queda
-	conn.SetReadLimit(512)
-	conn.SetReadDeadline(time.Now().Add(pongWait))
-
-	// Sempre que receber um Pong, renova a data de tolerância
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-
 	m.mu.Lock()
+	m.pruneInactiveLocked(time.Now(), "cliente sem heartbeat antes de nova conexao")
+
 	var assignedSide string
 	var client *Client
 
 	// Tenta alocar vaga livre
 	if m.PlayerLeft == nil {
 		assignedSide = "left"
-		client = &Client{conn: conn, side: assignedSide, send: make(chan []byte, stateQueueSize)}
+		client = newClient(conn, assignedSide)
 		m.PlayerLeft = client
 		fmt.Printf("[LOBBY ASSIGN] Cliente %s registrado com sucesso na vaga [ESQUERDA].\n", r.RemoteAddr)
 	} else if m.PlayerRight == nil {
 		assignedSide = "right"
-		client = &Client{conn: conn, side: assignedSide, send: make(chan []byte, stateQueueSize)}
+		client = newClient(conn, assignedSide)
 		m.PlayerRight = client
 		fmt.Printf("[LOBBY ASSIGN] Cliente %s registrado com sucesso na vaga [DIREITA].\n", r.RemoteAddr)
 	} else {
@@ -103,6 +136,7 @@ func (m *Manager) HandleWS(w http.ResponseWriter, r *http.Request) {
 			"type":  "error",
 			"error": "lobby_full",
 		})
+		conn.SetWriteDeadline(time.Now().Add(writeWait))
 		conn.WriteMessage(websocket.TextMessage, errPayload)
 		conn.Close()
 		return
@@ -118,6 +152,13 @@ func (m *Manager) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	m.Engine.PlayerConnected(count)
 	m.mu.Unlock()
+
+	conn.SetReadLimit(512)
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		client.markSeen()
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
 
 	// Envia mensagem de boas-vindas com o lado do jogador
 	setupMsg := SetupMessage{
@@ -149,6 +190,7 @@ func (m *Manager) readLoop(client *Client) {
 			// Erro na leitura indica desconexão legítima ou estouro de deadline
 			break
 		}
+		client.markSeen()
 
 		// A cada mensagem lida com sucesso, renovamos a tolerância de conexão
 		client.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -158,14 +200,69 @@ func (m *Manager) readLoop(client *Client) {
 		if err := json.Unmarshal(payload, &msg); err == nil {
 			if msg.Type == "input" {
 				// Repassa movimento de raquete para a Engine
-				m.Engine.SetPaddleDir(client.side, msg.Dir)
+				if m.hasFreshPairFor(client) {
+					m.Engine.SetPaddleDir(client.side, msg.Dir)
+				}
 			} else if msg.Type == "ready" {
 				// Repassa clique de lobby para a Engine
-				m.Engine.ToggleReady(client.side)
+				m.Engine.ToggleReady(client.side, m.hasFreshPairFor(client))
 			}
 		} else {
 			fmt.Printf("[WS RECV ERROR] Falha ao desserializar JSON de [%s]: %s\n", client.side, string(payload))
 		}
+	}
+}
+
+func (m *Manager) hasFreshPairFor(client *Client) bool {
+	now := time.Now()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.pruneInactiveLocked(now, "cliente sem heartbeat durante acao")
+	if !m.isActiveClientLocked(client) {
+		return false
+	}
+
+	return m.PlayerLeft != nil &&
+		m.PlayerRight != nil &&
+		m.PlayerLeft.isFresh(now) &&
+		m.PlayerRight.isFresh(now)
+}
+
+func (m *Manager) isActiveClientLocked(client *Client) bool {
+	if client == nil {
+		return false
+	}
+
+	return (client.side == "left" && m.PlayerLeft == client) ||
+		(client.side == "right" && m.PlayerRight == client)
+}
+
+func (m *Manager) pruneInactiveLocked(now time.Time, reason string) {
+	if m.PlayerLeft != nil && !m.PlayerLeft.isFresh(now) {
+		m.removeClientLocked(m.PlayerLeft, reason)
+	}
+	if m.PlayerRight != nil && !m.PlayerRight.isFresh(now) {
+		m.removeClientLocked(m.PlayerRight, reason)
+	}
+}
+
+func (m *Manager) removeClientLocked(client *Client, reason string) {
+	if client == nil {
+		return
+	}
+
+	if client.side == "left" && m.PlayerLeft == client {
+		m.PlayerLeft = nil
+		client.conn.Close()
+		fmt.Printf("[WS DISCONNECT] Vaga [ESQUERDA] liberada. Motivo: %s\n", reason)
+		m.Engine.PlayerDisconnected()
+	} else if client.side == "right" && m.PlayerRight == client {
+		m.PlayerRight = nil
+		client.conn.Close()
+		fmt.Printf("[WS DISCONNECT] Vaga [DIREITA] liberada. Motivo: %s\n", reason)
+		m.Engine.PlayerDisconnected()
 	}
 }
 
@@ -202,18 +299,7 @@ func (m *Manager) disconnect(client *Client, reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Garante que só limpará a vaga se a conexão sendo limpa ainda for a ativa daquele lado
-	if client.side == "left" && m.PlayerLeft == client {
-		m.PlayerLeft = nil
-		client.conn.Close()
-		fmt.Printf("[WS DISCONNECT] Vaga [ESQUERDA] liberada. Motivo: %s\n", reason)
-		m.Engine.PlayerDisconnected()
-	} else if client.side == "right" && m.PlayerRight == client {
-		m.PlayerRight = nil
-		client.conn.Close()
-		fmt.Printf("[WS DISCONNECT] Vaga [DIREITA] liberada. Motivo: %s\n", reason)
-		m.Engine.PlayerDisconnected()
-	}
+	m.removeClientLocked(client, reason)
 }
 
 // StartGameLoop roda a 30 FPS computando as regras e atualizando ambos os clientes em tempo real
@@ -222,6 +308,10 @@ func (m *Manager) StartGameLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		m.mu.Lock()
+		m.pruneInactiveLocked(time.Now(), "cliente sem heartbeat recente")
+		m.mu.Unlock()
+
 		// 1. Atualiza regras físicas e estados na engine
 		m.Engine.Update()
 
@@ -261,6 +351,6 @@ func (m *Manager) enqueueLatest(client *Client, payload []byte) {
 	select {
 	case client.send <- payload:
 	default:
-		fmt.Printf("[WS DROP] Cliente [%s] nao consumiu o frame anterior; mantendo apenas o estado mais recente.\n", client.side)
+		client.recordDroppedFrame()
 	}
 }

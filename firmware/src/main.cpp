@@ -40,6 +40,9 @@ const char* wsPath   = "/ws";
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000UL;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000UL;
 const unsigned long WIFI_STATUS_LOG_INTERVAL_MS = 1000UL;
+const unsigned long ACTIVE_RENDER_INTERVAL_MS = 33UL;
+const unsigned long STATIC_RENDER_INTERVAL_MS = 200UL;
+const unsigned long READY_DEBOUNCE_MS = 200UL;
 
 // Instâncias Globais
 WebSocketsClient webSocket;
@@ -49,6 +52,25 @@ bool wifiReady = false;
 bool webSocketStarted = false;
 wl_status_t lastWiFiStatus = (wl_status_t)-1;
 unsigned long lastWiFiReconnectAttempt = 0;
+unsigned long lastRenderAt = 0;
+unsigned long lastReadySentAt = 0;
+
+struct GameSnapshot {
+  char state[24];
+  int bx;
+  int by;
+  int p1;
+  int p2;
+  int s1;
+  int s2;
+  bool p1Ready;
+  bool p2Ready;
+  uint32_t frame;
+  bool hasState;
+};
+
+GameSnapshot latestSnapshot = {"waiting_players", 0, 0, 24, 24, 0, 0, false, false, 0, false};
+bool renderDirty = false;
 
 // Variáveis para otimização de envio de mensagens e debouncing dos botões
 int lastSentDir = 0;         // Guarda a última direção enviada (-1, 1, 0)
@@ -140,6 +162,42 @@ void drawGameOver(int s1, int s2) {
   display.display();
 }
 
+void renderLatestSnapshot() {
+  if (!latestSnapshot.hasState || !renderDirty) {
+    return;
+  }
+
+  unsigned long now = millis();
+  bool activeGame = strcmp(latestSnapshot.state, "playing") == 0;
+  unsigned long interval = activeGame ? ACTIVE_RENDER_INTERVAL_MS : STATIC_RENDER_INTERVAL_MS;
+  if (now - lastRenderAt < interval) {
+    return;
+  }
+
+  lastRenderAt = now;
+  renderDirty = false;
+
+  if (strcmp(latestSnapshot.state, "waiting_players") == 0) {
+    drawText("PONG MULTIPLAYER", "Lado Atribuido:", playerSide.equalsIgnoreCase("left") ? "ESQUERDA" : "DIREITA", "AGUARDANDO P2...");
+  } else if (strcmp(latestSnapshot.state, "waiting_ready") == 0) {
+    char line1[30];
+    char line2[30];
+    sprintf(line1, "VOCE (%s): %s",
+            playerSide.equalsIgnoreCase("left") ? "ESQ" : "DIR",
+            (playerSide.equalsIgnoreCase("left") ? latestSnapshot.p1Ready : latestSnapshot.p2Ready) ? "PRONTO" : "ESPERANDO");
+    sprintf(line2, "RIVAL: %s",
+            (playerSide.equalsIgnoreCase("left") ? latestSnapshot.p2Ready : latestSnapshot.p1Ready) ? "PRONTO" : "ESPERANDO");
+
+    drawText("LOBBY: APERTE BOTAO", line1, line2, "Clique p/ Ready!");
+  } else if (activeGame) {
+    drawActiveGame(latestSnapshot.bx, latestSnapshot.by, latestSnapshot.p1, latestSnapshot.p2);
+  } else if (strcmp(latestSnapshot.state, "point_scored") == 0) {
+    drawPointScored(latestSnapshot.s1, latestSnapshot.s2);
+  } else if (strcmp(latestSnapshot.state, "gameover") == 0) {
+    drawGameOver(latestSnapshot.s1, latestSnapshot.s2);
+  }
+}
+
 // Envia comando JSON para o WebSocket do servidor Go
 void sendWSMessage(String jsonPayload) {
   if (!wifiReady || !webSocketStarted) {
@@ -156,6 +214,8 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     case WStype_DISCONNECTED:
       Serial.println("[WS] Status: Desconectado.");
       gameState = "waiting_players";
+      latestSnapshot.hasState = false;
+      renderDirty = false;
       if (wifiReady) {
         String ipLine = "IP: " + WiFi.localIP().toString();
         drawText("PONG MULTIPLAYER", "Status: Offline", "Tentando conectar...", ipLine.c_str());
@@ -166,13 +226,15 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
     case WStype_CONNECTED:
       Serial.println("[WS] Status: Conectado!");
+      latestSnapshot.hasState = false;
+      renderDirty = false;
       drawText("PONG MULTIPLAYER", "Status: Conectado", "Aguardando setup...");
       break;
 
     case WStype_TEXT: {
       // Faz o parsing do JSON recebido do servidor Go
       JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, payload);
+      DeserializationError error = deserializeJson(doc, payload, length);
       if (error) {
         Serial.print("Erro no JSON: ");
         Serial.println(error.c_str());
@@ -191,42 +253,19 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       else if (msgType == "state") {
         gameState = doc["state"] | "waiting_players";
         
-        int bx = doc["bx"] | 0;
-        int by = doc["by"] | 0;
-        int p1 = doc["p1"] | 0;
-        int p2 = doc["p2"] | 0;
-        int s1 = doc["s1"] | 0;
-        int s2 = doc["s2"] | 0;
-        bool p1Ready = doc["p1_ready"] | false;
-        bool p2Ready = doc["p2_ready"] | false;
+        snprintf(latestSnapshot.state, sizeof(latestSnapshot.state), "%s", gameState.c_str());
+        latestSnapshot.bx = doc["bx"] | 0;
+        latestSnapshot.by = doc["by"] | 0;
+        latestSnapshot.p1 = doc["p1"] | 0;
+        latestSnapshot.p2 = doc["p2"] | 0;
+        latestSnapshot.s1 = doc["s1"] | 0;
+        latestSnapshot.s2 = doc["s2"] | 0;
+        latestSnapshot.p1Ready = doc["p1_ready"] | false;
+        latestSnapshot.p2Ready = doc["p2_ready"] | false;
+        latestSnapshot.frame = doc["frame"] | (latestSnapshot.frame + 1);
+        latestSnapshot.hasState = true;
+        renderDirty = true;
 
-        // Renderiza na tela do OLED SSD1306 baseado na Máquina de Estados recebida do Go
-        if (gameState == "waiting_players") {
-          drawText("PONG MULTIPLAYER", "Lado Atribuido:", playerSide.equalsIgnoreCase("left") ? "ESQUERDA" : "DIREITA", "AGUARDANDO P2...");
-        } 
-        else if (gameState == "waiting_ready") {
-          // Renderiza tela de Lobby com Prontidão dos dois lados
-          char line1[30];
-          char line2[30];
-          sprintf(line1, "VOCE (%s): %s", playerSide.equalsIgnoreCase("left") ? "ESQ" : "DIR", 
-                  (playerSide.equalsIgnoreCase("left") ? p1Ready : p2Ready) ? "PRONTO" : "ESPERANDO");
-          sprintf(line2, "RIVAL: %s", 
-                  (playerSide.equalsIgnoreCase("left") ? p2Ready : p1Ready) ? "PRONTO" : "ESPERANDO");
-          
-          drawText("LOBBY: APERTE BOTAO", line1, line2, "Clique p/ Ready!");
-        } 
-        else if (gameState == "playing") {
-          // Gameplay ativo: OCULTA O PLACAR (Tela limpa)
-          drawActiveGame(bx, by, p1, p2);
-        } 
-        else if (gameState == "point_scored") {
-          // Ponto marcado: Mostra o placar gigante na tela
-          drawPointScored(s1, s2);
-        } 
-        else if (gameState == "gameover") {
-          // Fim de jogo: Mostra vencedor
-          drawGameOver(s1, s2);
-        }
       }
       break;
     }
@@ -430,6 +469,7 @@ void loop() {
   if (wifiReady && webSocketStarted) {
     webSocket.loop();
   }
+  renderLatestSnapshot();
 
   // Lê os botões físicos
   bool upPressed = (digitalRead(PIN_BTN_UP) == LOW);
@@ -442,10 +482,10 @@ void loop() {
     bool upJustPressed = (upPressed && lastUpState == HIGH);
     bool downJustPressed = (downPressed && lastDownState == HIGH);
 
-    if (upJustPressed || downJustPressed) {
+    if ((upJustPressed || downJustPressed) && (millis() - lastReadySentAt >= READY_DEBOUNCE_MS)) {
+      lastReadySentAt = millis();
       Serial.println("[BOTAO] Pressionado no Lobby! Alternando status de Pronto.");
       sendWSMessage("{\"type\":\"ready\"}");
-      delay(150); // debounce simples
     }
   }
 
@@ -476,5 +516,5 @@ void loop() {
   lastUpState = digitalRead(PIN_BTN_UP) ? HIGH : LOW;
   lastDownState = digitalRead(PIN_BTN_DOWN) ? HIGH : LOW;
   
-  delay(10); // Intervalo confortável de ciclo de polling
+  delay(1); // Mantem o loop responsivo para drenar o WebSocket.
 }
