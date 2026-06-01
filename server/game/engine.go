@@ -37,23 +37,23 @@ type Engine struct {
 	BallVY float64
 
 	// Posições e direções das raquetes
-	PaddleLeftY   float64
-	PaddleRightY  float64
-	PaddleLeftDir float64 // -1 = Sobe, 1 = Desce, 0 = Parado
+	PaddleLeftY    float64
+	PaddleRightY   float64
+	PaddleLeftDir  float64 // -1 = Sobe, 1 = Desce, 0 = Parado
 	PaddleRightDir float64
 
 	// Lógica de placar e controle de jogadores "Prontos" no Lobby
-	ScoreLeft       int
-	ScoreRight      int
-	PlayerLeftReady bool
+	ScoreLeft        int
+	ScoreRight       int
+	PlayerLeftReady  bool
 	PlayerRightReady bool
 
 	// Estado Atual: "waiting_players", "waiting_ready", "playing", "point_scored", "gameover"
 	Status string
 
 	// Controles internos de tempo de estados (medido em ticks de 33ms)
-	timerTicks  int
-	lastScorer  string // "left" ou "right" (usado para direcionar o saque)
+	timerTicks int
+	lastScorer string // "left" ou "right" (usado para direcionar o saque)
 }
 
 // NewEngine inicializa e retorna a estrutura da engine do jogo
@@ -138,7 +138,9 @@ func (e *Engine) ToggleReady(side string) {
 	if e.PlayerLeftReady && e.PlayerRightReady {
 		e.Status = "playing"
 		fmt.Println("[ENGINE] PARTIDA INICIADA! Ambos os jogadores estao prontos.")
-		e.triggerReset("left") // O primeiro saque do jogo vai em direção à esquerda (P1)
+		e.ResetPositions()
+		e.lastScorer = "left" // O primeiro saque do jogo vai em direcao a esquerda (P1)
+		e.launchBall()
 	}
 }
 
@@ -162,7 +164,7 @@ func (e *Engine) launchBall() {
 		e.BallVX = speedX // Lança para o jogador da direita
 		fmt.Println("[ENGINE] SAQUE: Bola lancada em direcao a DIREITA")
 	}
-	
+
 	// Angulação vertical aleatória
 	e.BallVY = (rand.Float64()*2.0 - 1.0) * 1.2
 }
@@ -252,7 +254,7 @@ func (e *Engine) Update() {
 			// Cálculo dinâmico do ângulo com base no ponto de impacto
 			relativeY := (e.BallY + BallSize/2.0) - (e.PaddleLeftY + PaddleHeight/2.0)
 			normalizedRelativeIntersectY := relativeY / (PaddleHeight / 2.0)
-			
+
 			// Inverte direção horizontal e aumenta velocidade em 5%
 			e.BallVX = -e.BallVX * 1.05
 			e.BallVY = normalizedRelativeIntersectY * 2.0 * 1.05
@@ -288,7 +290,7 @@ func (e *Engine) Update() {
 
 // checkRoundEnd verifica se o ponto decretou fim da partida ou apenas fim do round com logs detalhados
 func (e *Engine) checkRoundEnd(targetDirection string) {
-	// Regras da vitória clássicas: 
+	// Regras da vitória clássicas:
 	// 1. Um jogador precisa marcar pelo menos 11 pontos.
 	// 2. Deve haver uma diferença mínima de 2 pontos (ex: 11-9, 12-10).
 	if e.ScoreLeft >= MaxScore && (e.ScoreLeft-e.ScoreRight) >= 2 {

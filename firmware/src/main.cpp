@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -5,28 +6,49 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h> // Para desserializar o estado e serializar os inputs
 
+// [FIX] Cabecalhos para desabilitar o detector de brownout por hardware
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
 // 1. Configurações da tela OLED SSD1306 via I2C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define SCREEN_ADDRESS 0x3C
+const uint32_t OLED_I2C_CLOCK_HZ = 400000;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // 2. Definição dos pinos físicos dos botões (Pull-up interno)
 #define PIN_BTN_UP   12
 #define PIN_BTN_DOWN 14
 
-// 3. Configurações de Conectividade (Padrão para Wokwi e se.maiconda.com)
-const char* wifiSSID = "Wokwi-GUEST";
-const char* wifiPass = "";
+// 3. Configurações de Conectividade
+#ifndef WIFI_SSID
+#define WIFI_SSID "GOAT"
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "brasiliaazul"
+#endif
+
+const char* wifiSSID = WIFI_SSID;
+const char* wifiPass = WIFI_PASSWORD;
 const char* wsHost   = "se.maiconda.com";
 const uint16_t wsPort = 443;
 const char* wsPath   = "/ws";
+
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000UL;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000UL;
+const unsigned long WIFI_STATUS_LOG_INTERVAL_MS = 1000UL;
 
 // Instâncias Globais
 WebSocketsClient webSocket;
 String playerSide = "";      // "left" ou "right" (atribuído pelo servidor)
 String gameState = "waiting_players"; // Estado atual do jogo
+bool wifiReady = false;
+bool webSocketStarted = false;
+wl_status_t lastWiFiStatus = (wl_status_t)-1;
+unsigned long lastWiFiReconnectAttempt = 0;
 
 // Variáveis para otimização de envio de mensagens e debouncing dos botões
 int lastSentDir = 0;         // Guarda a última direção enviada (-1, 1, 0)
@@ -120,6 +142,11 @@ void drawGameOver(int s1, int s2) {
 
 // Envia comando JSON para o WebSocket do servidor Go
 void sendWSMessage(String jsonPayload) {
+  if (!wifiReady || !webSocketStarted) {
+    Serial.println("[WS] Envio ignorado: Wi-Fi/WebSocket offline.");
+    return;
+  }
+
   webSocket.sendTXT(jsonPayload);
 }
 
@@ -129,7 +156,12 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     case WStype_DISCONNECTED:
       Serial.println("[WS] Status: Desconectado.");
       gameState = "waiting_players";
-      drawText("PONG MULTIPLAYER", "Status: Offline", "Tentando conectar...", "IP: 10.10.0.2");
+      if (wifiReady) {
+        String ipLine = "IP: " + WiFi.localIP().toString();
+        drawText("PONG MULTIPLAYER", "Status: Offline", "Tentando conectar...", ipLine.c_str());
+      } else {
+        drawText("PONG MULTIPLAYER", "Status: Offline", "Wi-Fi indisponivel", "Reconectando...");
+      }
       break;
 
     case WStype_CONNECTED:
@@ -205,13 +237,176 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   }
 }
 
+const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:     return "WL_IDLE_STATUS - aguardando inicio";
+    case WL_NO_SSID_AVAIL:   return "WL_NO_SSID_AVAIL - SSID nao encontrado";
+    case WL_SCAN_COMPLETED:  return "WL_SCAN_COMPLETED - scan concluido";
+    case WL_CONNECTED:       return "WL_CONNECTED - conectado";
+    case WL_CONNECT_FAILED:  return "WL_CONNECT_FAILED - senha/AP recusou";
+    case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST - conexao perdida";
+    case WL_DISCONNECTED:    return "WL_DISCONNECTED - desconectado";
+    default:                 return "WL_UNKNOWN - estado desconhecido";
+  }
+}
+
+const char* wifiStatusShort(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:     return "Ocioso";
+    case WL_NO_SSID_AVAIL:   return "SSID ausente";
+    case WL_SCAN_COMPLETED:  return "Scan OK";
+    case WL_CONNECTED:       return "Conectado";
+    case WL_CONNECT_FAILED:  return "Falha auth";
+    case WL_CONNECTION_LOST: return "Sinal caiu";
+    case WL_DISCONNECTED:    return "Desconectado";
+    default:                 return "Desconhecido";
+  }
+}
+
+void logWiFiStatus(wl_status_t status, bool force = false) {
+  if (!force && status == lastWiFiStatus) {
+    return;
+  }
+
+  lastWiFiStatus = status;
+  Serial.printf("[WIFI] Estado: %s (cod: %d)\n", wifiStatusName(status), (int)status);
+}
+
+void drawWiFiConnected() {
+  String ipLine = "IP: " + WiFi.localIP().toString();
+  String rssiLine = "RSSI: " + String(WiFi.RSSI()) + " dBm";
+  drawText("PONG MULTIPLAYER", "Wi-Fi: conectado", ipLine.c_str(), rssiLine.c_str());
+}
+
+void logWiFiDetails() {
+  String ip = WiFi.localIP().toString();
+  String gateway = WiFi.gatewayIP().toString();
+
+  Serial.println("[WIFI] Conexao estabelecida.");
+  Serial.printf("[WIFI] SSID    : %s\n", WiFi.SSID().c_str());
+  Serial.printf("[WIFI] IP      : %s\n", ip.c_str());
+  Serial.printf("[WIFI] Gateway : %s\n", gateway.c_str());
+  Serial.printf("[WIFI] RSSI    : %d dBm\n", WiFi.RSSI());
+  Serial.printf("[WIFI] Canal   : %d\n", WiFi.channel());
+}
+
+bool connectWiFi() {
+  Serial.println();
+  Serial.println("[WIFI] Inicializando cliente Wi-Fi (STA)...");
+  Serial.printf("[WIFI] SSID alvo: %s\n", wifiSSID);
+  Serial.printf("[WIFI] Timeout : %lu ms\n", WIFI_CONNECT_TIMEOUT_MS);
+  drawText("PONG MULTIPLAYER", "Wi-Fi: iniciando", wifiSSID, "Aguarde...");
+
+  WiFi.mode(WIFI_OFF);
+  delay(300);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  delay(100);
+
+  WiFi.begin(wifiSSID, wifiPass);
+  lastWiFiReconnectAttempt = millis();
+
+  unsigned long start = millis();
+  unsigned long lastProgressLog = 0;
+
+  while (millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    wl_status_t status = WiFi.status();
+    logWiFiStatus(status);
+
+    if (status == WL_CONNECTED) {
+      wifiReady = true;
+      logWiFiDetails();
+      drawWiFiConnected();
+      return true;
+    }
+
+    if (millis() - lastProgressLog >= WIFI_STATUS_LOG_INTERVAL_MS) {
+      lastProgressLog = millis();
+      Serial.printf("[WIFI] Aguardando conexao... %lus/%lus | %s\n",
+                    (millis() - start) / 1000,
+                    WIFI_CONNECT_TIMEOUT_MS / 1000,
+                    wifiStatusShort(status));
+    }
+
+    delay(250);
+  }
+
+  wl_status_t status = WiFi.status();
+  logWiFiStatus(status, true);
+  Serial.printf("[WIFI] Timeout conectando em '%s'. Ultimo estado: %s\n",
+                wifiSSID,
+                wifiStatusName(status));
+  Serial.println("[WIFI] Verifique SSID, senha, sinal e alimentacao do ESP32.");
+  drawText("PONG MULTIPLAYER", "Wi-Fi: falhou", wifiStatusShort(status), "Tentando novamente");
+  wifiReady = false;
+  return false;
+}
+
+void startWebSocket() {
+  if (!wifiReady || webSocketStarted) {
+    return;
+  }
+
+  Serial.printf("[WS] Conectando em wss://%s:%u%s\n", wsHost, (unsigned)wsPort, wsPath);
+  drawText("PONG MULTIPLAYER", "Wi-Fi: OK", "Conectando WS...");
+  webSocket.beginSSL(wsHost, wsPort, wsPath);
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  webSocketStarted = true;
+}
+
+void maintainWiFi() {
+  wl_status_t status = WiFi.status();
+  logWiFiStatus(status);
+
+  if (status == WL_CONNECTED) {
+    if (!wifiReady) {
+      wifiReady = true;
+      Serial.println("[WIFI] Reconexao concluida.");
+      logWiFiDetails();
+      drawWiFiConnected();
+      startWebSocket();
+    }
+    return;
+  }
+
+  if (wifiReady) {
+    wifiReady = false;
+    gameState = "waiting_players";
+    Serial.println("[WIFI] Conexao perdida. WebSocket sera reiniciado apos o Wi-Fi voltar.");
+    drawText("PONG MULTIPLAYER", "Wi-Fi: offline", wifiStatusShort(status), "Reconectando...");
+
+    if (webSocketStarted) {
+      webSocket.disconnect();
+      webSocketStarted = false;
+    }
+  }
+
+  if (millis() - lastWiFiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
+    lastWiFiReconnectAttempt = millis();
+    Serial.printf("[WIFI] Tentando reconectar em '%s'...\n", wifiSSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID, wifiPass);
+  }
+}
+
 void setup() {
+  // [FIX 1] Desabilita o detector de brownout antes de qualquer outra instrução.
+  // Evita o reset causado pelo pico de corrente (~300mA) ao ligar o rádio Wi-Fi.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(100);
 
   // Inicializa botões físicos com pull-up interno
   pinMode(PIN_BTN_UP, INPUT_PULLUP);
   pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
+
+  Wire.begin();
+  Wire.setClock(OLED_I2C_CLOCK_HZ);
+  Serial.printf("[OLED] I2C clock configurado para %lu Hz\n", (unsigned long)OLED_I2C_CLOCK_HZ);
 
   // Inicializa a tela OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -221,25 +416,20 @@ void setup() {
   
   drawText("PONG MULTIPLAYER", "Iniciando...", "Buscando Wi-Fi...");
 
-  // Conecta ao Wi-Fi virtual do Wokwi
-  WiFi.begin(wifiSSID, wifiPass);
-  Serial.print("Conectando ao Wi-Fi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  if (connectWiFi()) {
+    startWebSocket();
+  } else {
+    Serial.println("[WIFI] Sem conexao inicial. O loop tentara reconectar automaticamente.");
   }
-  Serial.println("\nWi-Fi Conectado!");
-  drawText("PONG MULTIPLAYER", "Wi-Fi: OK", "Conectando WS...");
-
-  // Conecta ao WebSocket Seguro do servidor Go
-  webSocket.beginSSL(wsHost, wsPort, wsPath);
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000); // Reconecta em 5s se cair
 }
 
 void loop() {
-  // Mantém a escuta do WebSocket
-  webSocket.loop();
+  maintainWiFi();
+
+  // Mantem a escuta do WebSocket apenas quando a rede estiver disponivel.
+  if (wifiReady && webSocketStarted) {
+    webSocket.loop();
+  }
 
   // Lê os botões físicos
   bool upPressed = (digitalRead(PIN_BTN_UP) == LOW);
